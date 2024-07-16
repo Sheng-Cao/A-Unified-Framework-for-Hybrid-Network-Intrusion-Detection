@@ -1,3 +1,4 @@
+from copy import copy
 import random
 import time
 import numpy as np
@@ -5,12 +6,14 @@ import torch
 import os
 import argparse
 import xgboost as xgb
-from torch import nn
+from torch import cdist, nn
 from dataloader import DATA_LOADER
 from sklearn.metrics import roc_auc_score, precision_recall_curve, auc, f1_score, accuracy_score, confusion_matrix, \
     classification_report
+from tqdm import trange
+from models import Embedding_Net
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 
 # required functions
@@ -32,13 +35,24 @@ def compute_per_class_acc(test_label, predicted_label, nclass):
     return acc_per_class.mean()
 
 
-def indicator(K_matrix, sentry):
-    seen_count = (K_matrix >= sentry).sum(dim=1)
-    unseen_count = K_matrix.shape[1] - seen_count
-    # score = torch.where(seen_count < weight_test * unseen_count, torch.tensor(0.0, device=K_matrix.device), torch.tensor(1.0, device=K_matrix.device))
-    score = unseen_count
-    return score
+def indicator(K_matrix):
+    K_matrix = K_matrix.long()
 
+    # 获取权重值
+    weights_in = weights[K_matrix]
+
+    # 对20个近邻的权重求和
+    weighted_unseen_count = weights_in.sum(dim=1)
+
+    return weighted_unseen_count
+
+
+# def indicator(K_matrix, sentry):
+#     seen_count = (K_matrix >= sentry).sum(dim=1)
+#     unseen_count = K_matrix.shape[1] - seen_count
+#     # score = torch.where(seen_count < weight_test * unseen_count, torch.tensor(0.0, device=K_matrix.device), torch.tensor(1.0, device=K_matrix.device))
+#     score = unseen_count
+#     return score
 
 def evaluation(y_true, score, option):
     if option == 3:
@@ -58,6 +72,7 @@ def evaluation(y_true, score, option):
     f1_scores = 2 * (precision * recall) / (precision + recall)
     best_f1_index = np.argmax(f1_scores)
     best_threshold = _[best_f1_index]
+    print(best_threshold)
     y_pred = (score >= best_threshold).astype(int)
 
     # calculate F1-Score
@@ -109,18 +124,23 @@ def evaluation(y_true, score, option):
 
             recall = tp / (tp + fn) if (tp + fn) > 0 else 0
             recall_per_class[cls.item()] = recall
+
     print("Recall per class:")
     for cls, recall in recall_per_class.items():
         print(f"Class {dataset.attacks[cls]}: Recall = {recall}")
+    return y_pred
 
 
 parser = argparse.ArgumentParser()
 
 # set hyperparameters
-parser.add_argument('--dataset', default='0')
+parser.add_argument('--dataset', default='9')
 parser.add_argument('--matdataset', default=True)
 parser.add_argument('--standardization', action='store_true', default=False)
 parser.add_argument('--manualSeed', type=int, default=42)
+parser.add_argument('--resSize', type=int, default=70, help='size of visual features')
+parser.add_argument('--embedSize', type=int, default=128, help='size of embedding h')
+parser.add_argument('--outzSize', type=int, default=32, help='size of non-liner projection z')
 
 opt = parser.parse_args()
 
@@ -142,7 +162,7 @@ dataset = DATA_LOADER(opt)
 # 1st step: Detect malicious traffic
 from adbench.baseline.Supervised import supervised
 
-model = supervised(seed=42, model_name='XGB')  # initialization
+model = supervised(seed=42, model_name='CatB')  # initialization
 
 # training proceduce of detector
 print("start fittting detector")
@@ -155,75 +175,110 @@ print("Training time of the detector：%.4f seconds" % (end_time - start_time))
 # inferece proceduce of detector
 print("start evaluating detector")
 start_time = time.time()
-score = model.predict_score(dataset.test_feature.cpu().numpy())  # predict
+detector_score = model.predict_score(dataset.test_feature.cpu().numpy())  # predict
 end_time = time.time()
 # evaluation of detector
 y_true = dataset.binary_test.cpu().numpy()
-evaluation(y_true, score, 0)
+detector_prediction = evaluation(y_true, detector_score, 0)
 print("end evaluating detector")
 print("Inference time of the detector：%.4f seconds" % (end_time - start_time))
 
 # 2nd step: Discriminate unknown categories traffic
-test_feature = dataset.test_feature[dataset.benign_size_test:]
-all_feature = torch.cat((test_feature, dataset.train_seen_feature), dim=0).detach()
+test_feature = dataset.all_malicious_feature[dataset.train_seen_feature.shape[0]:]
 
 # sentry denotes whether it belongs to the test set or training set
 sentry = test_feature.shape[0]
 
 # initailize hyperparameters and matrixes
 pairwise = nn.PairwiseDistance(p=2)
-K = 50
+K = 20
 indice_matrix = torch.IntTensor(size=(test_feature.shape[0], K)).to(device)
-dis_matrix = torch.FloatTensor(size=(test_feature.shape[0], K)).to(device)
+
+# 获取每个标签及其对应的数量
+unique_labels, counts = torch.unique(dataset.train_seen_label, return_counts=True)
+
+# 初始化权值矩阵
+train_weights = torch.zeros_like(dataset.train_seen_label, dtype=torch.float32).to(device)
+
+# 遍历每个标签及其对应的数量
+# for label, count in zip(unique_labels, counts):
+#     if count.item() < 100:
+#         train_weights[dataset.train_seen_label == label] = -K/count
+
+test_weights = torch.ones_like(dataset.test_seen_unseen_label, dtype=torch.float32).to(device)
+weights = torch.cat((train_weights, test_weights), dim=0)
 
 # training proceduce of discriminator
 print("start fittting and evaluating discriminator")
 start_time = time.time()
-for i in range(test_feature.shape[0]):
-    expand_feature = test_feature[i].unsqueeze(0).expand_as(all_feature)
-    dis = pairwise(expand_feature, all_feature)
+for i in trange(test_feature.shape[0]):
+    expand_feature = test_feature[i].unsqueeze(0).expand_as(dataset.all_malicious_feature)
+    dis = pairwise(expand_feature, dataset.all_malicious_feature)
     # sort and selection
-    distances, indices = torch.topk(dis, k=K, largest=False)
-    dis_matrix[i] = distances
+    _, indices = torch.topk(dis, k=K, largest=False)
     indice_matrix[i] = indices
 
 # inference proceduce of discriminator
-score = indicator(indice_matrix, sentry)
+discriminator_score = indicator(indice_matrix)
+
 end_time = time.time()
 
-print("Training and inference time of the discriminator%.4f seconds" % (end_time - start_time))
+print("Training and inference time of the discriminator：%.4f seconds" % (end_time - start_time))
 
 y_true = dataset.test_seen_unseen_label.cpu().numpy()
-score = score.cpu().numpy()
-evaluation(y_true, score, 1)
+
+discriminator_score = discriminator_score.cpu().numpy()
+
+discriminator_prediction = evaluation(y_true, discriminator_score, 1)
 print("end fittting and evaluating discriminator")
 
 # 3rd step: Classify known categories traffic
 
-# training proceduce of classfier
-xgbmodel = xgb.XGBClassifier()
-xgbmodel.fit(dataset.train_feature.cpu().numpy(), map_label(dataset.train_label, dataset.seenclasses).cpu().numpy())
-# inferece proceduce of classfier
-preds = xgbmodel.predict(dataset.test_seen_feature.cpu().numpy())
-# evaluation of classfier
-evaluation(map_label(dataset.test_seen_label, dataset.seenclasses).cpu().numpy(), preds, 3)
+# training proceduce of known_class_classifier
+known_class_classifier = xgb.XGBClassifier()
+known_class_classifier.fit(dataset.train_seen_feature.cpu().numpy(),
+                           map_label(dataset.train_seen_label, dataset.seenclasses).cpu().numpy())
+# inferece proceduce of known_class_classifier
+known_preds = known_class_classifier.predict(dataset.test_seen_feature.cpu().numpy())
+# evaluation of known_class_classifier
+evaluation(map_label(dataset.test_seen_label, dataset.seenclasses).cpu().numpy(), known_preds, 3)
 
-# score_for_unseen = score[dataset.test_seen_feature.shape[0]:]
-# score_for_seen = score[:dataset.test_seen_feature.shape[0]]
-# # training procedure of classifier
-# target_classes = dataset.seenclasses.cuda()
-# xgbmodel = xgb.XGBClassifier()
-# xgbmodel.fit(dataset.train_feature.cpu().numpy(), util.map_label(dataset.train_label, target_classes).cpu().numpy())
-# preds = xgbmodel.predict(dataset.test_seen_feature.cpu().numpy())
-# preds = torch.from_numpy(preds).cuda()
-# acc_seen = compute_per_class_acc(util.map_label(dataset.test_seen_label, target_classes), preds, target_classes.size(0))
-# print("seen_acc = ", acc_seen)
+# load unknown_class_classifier
+unknown_class_classifier = xgb.XGBClassifier()
+# booster = xgb.Booster()
+# unknown_class_classifier._Booster = booster
+unknown_class_classifier.load_model('./models/' + opt.dataset + '/cls.model')
+mapper = Embedding_Net(opt).to(device)
+mapper.load_state_dict(torch.load('./models/' + opt.dataset + '/map.pt'))
+mapper.eval()
+# inferece proceduce of unknown_class_classifier
+with torch.no_grad():
+    embed, _ = mapper(dataset.test_unseen_feature)
 
-# mask_unseen = (score_for_unseen == 1).cuda()
+unknown_preds = unknown_class_classifier.predict(embed.cpu().numpy())
+# evaluation of unknown_class_classifier
+evaluation(map_label(dataset.test_unseen_label, dataset.novelclasses).cpu().numpy(), unknown_preds, 3)
+
+# score_for_malicious = detector_prediction[dataset.benign_size_test:]
+# score_for_seen = discriminator_prediction[:dataset.test_seen_feature.shape[0]]
+# score_for_unseen = discriminator_prediction[dataset.test_seen_feature.shape[0]:]
+
+# mask_all = (score_for_malicious == 0).cuda()
+# mask_seen = (score_for_seen == 1).cuda()
+# mask_all_tail = mask_all[:dataset.test_seen_feature.shape[0]]
+
+# # 将mask_all_tail与mask_seen求并集
+# final_mask = mask_all_tail | mask_seen
+# preds[final_mask.cpu().numpy()] = 100
+# evaluation(map_label(dataset.test_seen_label, dataset.seenclasses).cpu().numpy(), preds, 3)
+
+
+# mask_unseen = (score_for_unseen == 1 or score_for_malicious == 0).cuda()
 # test_label = copy.deepcopy(dataset.test_unseen_feature)
 # test_label[mask_unseen] = 100
-# mask_seen = (score_for_seen == 0).cuda()
+# mask_seen = (score_for_seen == 0 or score_for_malicious == 0).cuda()
 # preds[mask_seen] = 100
+# evaluation(map_label(dataset.test_seen_label, dataset.seenclasses).cpu().numpy(), preds, 3)
 
 # target_classes = dataset.seenclasses.cuda()
 # acc_seen = compute_per_class_acc(util.map_label(dataset.test_seen_label, target_classes), preds, target_classes.size(0))
