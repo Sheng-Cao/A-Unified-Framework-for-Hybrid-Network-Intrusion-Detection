@@ -29,7 +29,7 @@ class DATA_LOADER(object):
         test_seen_label = matcontent['test_seen_label'] + 1
         test_unseen_feature = matcontent['test_unseen_feature']
         test_unseen_label = matcontent['test_unseen_label'] + 1
-        attacks = matcontent['attacks']
+        traffic_names = matcontent['attacks']
 
         # preprocessing
         detector_scaler = preprocessing.StandardScaler() if opt.standardization else preprocessing.MinMaxScaler()
@@ -83,9 +83,9 @@ class DATA_LOADER(object):
         self.test_unseen_label = torch.tensor(test_unseen_label, dtype=torch.long).cuda()
 
         # known, unknown, malicious, all traffic categories
-        self.seenclasses = torch.unique(self.test_seen_label)
+        self.knownclasses = torch.unique(self.test_seen_label)
         self.novelclasses = torch.unique(self.test_unseen_label)
-        self.maliciousclasses = torch.cat((self.seenclasses, self.novelclasses), dim=0)
+        self.maliciousclasses = torch.cat((self.knownclasses, self.novelclasses), dim=0)
         self.allclasses = torch.unique(self.test_label)
 
         # number of samples in training set and test set
@@ -93,14 +93,13 @@ class DATA_LOADER(object):
         self.ntest = self.test_feature.size()[0]
         # size of benign traffic
         self.benign_size_test = by_test.shape[0]
-        # malicious traffic categories
-        self.attacks = attacks
-
+        # all categories name
+        self.traffic_names = traffic_names
+        # print details of the dataset
         all_labels = torch.cat((self.train_label, self.test_label), dim=0)
         unique_labels, counts = torch.unique(all_labels, return_counts=True)
-        # print details of the dataset
         print("Dataset details")
         for i, count in zip(unique_labels, counts):
-            print(f'{self.attacks[i]}: {count.item()} samples')
-        print("Known malicious traffic categories:", self.attacks[self.seenclasses.cpu()])
-        print("Unknown malicious traffic categories:", self.attacks[self.novelclasses.cpu()])
+            print(f'{self.traffic_names[i]}: {count.item()} samples')
+        print("Known malicious traffic categories:", self.traffic_names[self.knownclasses.cpu()])
+        print("Unknown malicious traffic categories:", self.traffic_names[self.novelclasses.cpu()])
