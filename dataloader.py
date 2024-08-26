@@ -5,36 +5,32 @@ from sklearn import preprocessing
 
 class DATA_LOADER(object):
     def __init__(self, opt):
-        if opt.matdataset:
-            self.read_matdataset(opt)
         self.index_in_epoch = 0
         self.epochs_completed = 0
-
-    def read_matdataset(self, opt):
         # read malicious traffic and benign traffic
-        matcontent = np.load(f"/home/wy/code/CE-GZSL/data/{opt.dataset}.npz",
-                             allow_pickle=True)  # change to your root path
-        benign_matcontent = np.load("./data/benign.npz", allow_pickle=True)  # change to your root path
+        malicious_content = np.load(f"/home/wy/code/CE-GZSL/data/{opt.dataset}.npz",
+                                    allow_pickle=True)  # change to the root path
+        benign_content = np.load("./data/benign.npz", allow_pickle=True)  # change to the root path
 
         # benign traffic feature and label
-        bx_train = benign_matcontent['bx_train']
-        by_train = benign_matcontent['by_train']
-        bx_test = benign_matcontent['bx_test']
-        by_test = benign_matcontent['by_test']
+        bx_train = benign_content['bx_train']
+        by_train = benign_content['by_train']
+        bx_test = benign_content['bx_test']
+        by_test = benign_content['by_test']
 
         # malicious traffic feature and label
-        train_feature = matcontent['train_feature']
-        train_label = matcontent['train_label'] + 1
-        test_seen_feature = matcontent['test_seen_feature']
-        test_seen_label = matcontent['test_seen_label'] + 1
-        test_unseen_feature = matcontent['test_unseen_feature']
-        test_unseen_label = matcontent['test_unseen_label'] + 1
-        traffic_names = matcontent['attacks']
+        train_feature = malicious_content['train_feature']
+        train_label = malicious_content['train_label'] + 1
+        test_seen_feature = malicious_content['test_seen_feature']
+        test_seen_label = malicious_content['test_seen_label'] + 1
+        test_unseen_feature = malicious_content['test_unseen_feature']
+        test_unseen_label = malicious_content['test_unseen_label'] + 1
+        traffic_names = malicious_content['attacks']
 
         # preprocessing
-        detector_scaler = preprocessing.StandardScaler() if opt.standardization else preprocessing.MinMaxScaler()
-        discriminator_scaler = preprocessing.StandardScaler() if opt.standardization else preprocessing.MinMaxScaler()
-        classifier_scaler = preprocessing.StandardScaler() if opt.standardization else preprocessing.MinMaxScaler()
+        detector_scaler = preprocessing.MinMaxScaler()
+        discriminator_scaler = preprocessing.MinMaxScaler()
+        classifier_scaler = preprocessing.MinMaxScaler()
 
         combined_train_feature = np.concatenate((bx_train, train_feature), axis=0)
         combined_test_feature = np.concatenate((bx_test, test_seen_feature, test_unseen_feature), axis=0)
@@ -93,7 +89,7 @@ class DATA_LOADER(object):
         self.ntest = self.test_feature.size()[0]
         # size of benign traffic
         self.benign_size_test = by_test.shape[0]
-        # all categories name
+        # all categories names
         self.traffic_names = traffic_names
         # print details of the dataset
         all_labels = torch.cat((self.train_label, self.test_label), dim=0)

@@ -1,6 +1,9 @@
+from copy import deepcopy
 import random
 import time
+from matplotlib import pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 import os
 import argparse
@@ -16,6 +19,55 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 
 # required functions
+class ConfusionMatrix(object):
+    def __init__(self, num_classes: int, labels: list, highlight_indices: np.ndarray = None):
+        self.num_classes = num_classes
+        self.labels = labels
+        self.highlight_indices = highlight_indices
+        self.matrix = np.zeros((num_classes, num_classes))
+        self.confusion_matrix = np.zeros((num_classes, num_classes))
+
+    def update(self, preds, real):
+        for p, t in zip(preds, real):
+            self.matrix[p, t] += 1
+
+    def plot(self):
+        self.confusion_matrix = deepcopy(self.matrix)
+        for i in range(len(self.matrix[0])):
+            Total_Num = np.sum(self.matrix[:, i])
+            for j in range(len(self.matrix[0])):
+                self.confusion_matrix[j][i] = round(self.confusion_matrix[j][i] / Total_Num, 2)
+
+        matrix = np.array(self.confusion_matrix)
+        plt.figure(figsize=(10, 8))
+        plt.imshow(matrix, cmap='Blues', aspect='auto')
+
+        plt.xticks(range(self.num_classes), self.labels, rotation=45, fontsize=8)
+        plt.yticks(range(self.num_classes), self.labels, fontsize=8)
+        plt.colorbar()
+        plt.xlabel('True Labels')
+        plt.ylabel('Predicted Labels')
+
+        # mark probability
+        thresh = matrix.max() / 2
+        for x in range(self.num_classes):
+            for y in range(self.num_classes):
+                info = matrix[y, x]
+                plt.text(x, y, info,
+                         verticalalignment='center',
+                         horizontalalignment='center',
+                         color="white" if info > thresh else "black")
+
+        # Highlight specified indices
+        if self.highlight_indices is not None:
+            for index in self.highlight_indices:
+                plt.gca().get_xticklabels()[index].set_color('red')
+                plt.gca().get_yticklabels()[index].set_color('red')
+
+        plt.savefig('./confusion/confusion_matrix.svg')
+        plt.show()
+
+
 def map_label(label, classes):
     mapped_label = torch.zeros_like(label, dtype=torch.long)
     for i, class_label in enumerate(classes):
@@ -32,9 +84,22 @@ def inverse_map(label, classes):
 
 
 def indicator(K_matrix, sentry):
-    seen_count = (K_matrix < sentry).sum(dim=1)
-    unseen_count = K_matrix.shape[1] - seen_count
-    score = unseen_count
+    # obtain adaptive K for each sample
+    K_values = adaptive_K.view(-1).long()
+
+    # representing the first k neighbors to be calculated for each sample
+    indices = torch.arange(K_matrix.size(1)).expand(K_matrix.size(0), -1).to(device)
+
+    # broadcast K for each sample
+    mask = indices < K_values.unsqueeze(1)
+
+    # calculate seen count for each sample
+    seen_count = (K_matrix < sentry).float() * mask.float()
+    seen_count = seen_count.sum(dim=1)
+
+    # calculate ood score
+    score = K_values.float() / (seen_count + 1)
+
     return score
 
 
@@ -50,8 +115,14 @@ def evaluation(y_true, score, option):
         print(report)
         return
     if option == 5:
-        report = classification_report(y_true, score, target_names=dataset.traffic_names, digits=4)
+        report = classification_report(y_true, score, target_names=dataset.traffic_names, digits=4, output_dict=True)
         print(report)
+        df = pd.DataFrame(report).transpose()
+        drop_list = ['precision', 'f1-score', 'support']
+
+        for col in drop_list:
+            del df[col]
+        df.to_csv('./finalclswounknown' + '/' + opt.dataset + "result.csv", index=True)
         return
     # calculate AUC-ROC
     auc_roc = roc_auc_score(y_true, score)
@@ -94,6 +165,7 @@ def evaluation(y_true, score, option):
     # Calculate Class-wise Recall
     recall_per_class = {}
     y_pred = torch.from_numpy(y_pred).to(device)
+    ave_recall = 0
 
     if option == 0:  # detector
         for cls in dataset.allclasses:
@@ -118,7 +190,9 @@ def evaluation(y_true, score, option):
 
             recall = tp / (tp + fn) if (tp + fn) > 0 else 0
             recall_per_class[cls.item()] = recall
+            ave_recall += recall
 
+    ave_recall /= dataset.allclasses.shape[0]
     print("Recall per class:")
     for cls, recall in recall_per_class.items():
         print(f"Class {dataset.traffic_names[cls]}: Recall = {recall}")
@@ -128,13 +202,15 @@ def evaluation(y_true, score, option):
 parser = argparse.ArgumentParser()
 
 # set hyperparameters
-parser.add_argument('--dataset', default='181')
-parser.add_argument('--matdataset', default=True)
-parser.add_argument('--standardization', action='store_true', default=False)
+parser.add_argument('--dataset', default='3')
 parser.add_argument('--manualSeed', type=int, default=42)
 parser.add_argument('--resSize', type=int, default=70, help='size of visual features')
 parser.add_argument('--embedSize', type=int, default=128, help='size of embedding h')
 parser.add_argument('--outzSize', type=int, default=32, help='size of non-liner projection z')
+parser.add_argument('--kmin', type=int, default=3, help='local neightbors kmin')
+parser.add_argument('--kmax', type=int, default=20, help='local neightbors kmax')
+parser.add_argument('--khat', type=int, default=200, help='to calculate local density')
+parser.add_argument('--customized', type=bool, default=False, help='whether to use customized model')
 
 opt = parser.parse_args()
 
@@ -153,10 +229,10 @@ torch.backends.cudnn.benchmark = False
 # loading data
 dataset = DATA_LOADER(opt)
 
-# 1st step: Detect malicious traffic
+# # 1st step: Detect malicious traffic
 from adbench.baseline.Supervised import supervised
 
-model = supervised(seed=42, model_name='CatB')  # initialization
+model = supervised(seed=42, model_name='XGB')  # initialization
 
 # training proceduce of detector
 print("start fittting detector")
@@ -185,8 +261,9 @@ sentry = dataset.train_seen_feature.shape[0]
 
 # initailize hyperparameters and matrixes
 pairwise = nn.PairwiseDistance(p=2)
-K = 20
-indice_matrix = torch.IntTensor(size=(test_feature.shape[0], K)).to(device)
+khat = opt.khat
+indice_matrix = torch.IntTensor(size=(test_feature.shape[0], opt.kmax)).to(device)
+dis_matrix = torch.FloatTensor(size=(test_feature.shape[0], 1)).to(device)
 
 # training proceduce of discriminator
 print("start fittting and evaluating discriminator")
@@ -195,21 +272,24 @@ for i in trange(test_feature.shape[0]):
     expand_feature = test_feature[i].unsqueeze(0).expand_as(dataset.all_malicious_feature)
     dis = pairwise(expand_feature, dataset.all_malicious_feature)
     # sort and selection
-    _, indices = torch.topk(dis, k=K, largest=False)
-    indice_matrix[i] = indices
+    distances, indices = torch.topk(dis, k=khat, largest=False)
+    indice_matrix[i] = indices[:opt.kmax]
+    dis_matrix[i] = distances.mean()
 
 # inference proceduce of discriminator
+adaptive_K = torch.zeros_like(dis_matrix).to(device)
+min_distance = torch.min(dis_matrix)
+max_distance = torch.max(dis_matrix)
+normalized_distances = (dis_matrix - min_distance) / (max_distance - min_distance)
+inverted_distances = 1 - normalized_distances
+K_min = opt.kmin
+K_max = opt.kmax
+adaptive_K = (K_min + inverted_distances * (K_max - K_min)).long()
 discriminator_score = indicator(indice_matrix, sentry)
 
-end_time = time.time()
+discriminator_prediction, threshhold = evaluation(dataset.test_seen_unseen_label.cpu().numpy(),
+                                                  discriminator_score.cpu().numpy(), 1)
 
-print("Training and inference time of the discriminator：%.4f seconds" % (end_time - start_time))
-
-y_true = dataset.test_seen_unseen_label.cpu().numpy()
-
-discriminator_score = discriminator_score.cpu().numpy()
-
-discriminator_prediction, threshhold = evaluation(y_true, discriminator_score, 1)
 print("end fittting and evaluating discriminator")
 
 # 3rd step: Classify known categories traffic
@@ -225,18 +305,22 @@ evaluation(map_label(dataset.test_seen_label, dataset.knownclasses).cpu().numpy(
 
 # 4th step: Classify unknown categories traffic (Optional)
 # load unknown_class_classifier
-unknown_class_classifier = xgb.XGBClassifier()
-unknown_class_classifier.load_model('./models/' + opt.dataset + '/cls.model')
-mapper = Embedding_Net(opt).to(device)
-mapper.load_state_dict(torch.load('./models/' + opt.dataset + '/map.pt'))
-mapper.eval()
-# inferece proceduce of unknown_class_classifier
-with torch.no_grad():
-    embed, _ = mapper(dataset.test_unseen_feature)
+if opt.customized:
+    unknown_class_classifier = xgb.XGBClassifier()
+    unknown_class_classifier.load_model('./models/' + opt.dataset + '/cls.model')
+    mapper = Embedding_Net(opt).to(device)
+    mapper.load_state_dict(torch.load('./models/' + opt.dataset + '/map.pt'))
+    mapper.eval()
+    # inferece proceduce of unknown_class_classifier
+    with torch.no_grad():
+        embed, _ = mapper(dataset.test_unseen_feature)
 
-unknown_preds = unknown_class_classifier.predict(embed.cpu().numpy())
-# evaluation of unknown_class_classifier
-evaluation(map_label(dataset.test_unseen_label, dataset.novelclasses).cpu().numpy(), unknown_preds, 4)
+    unknown_preds = unknown_class_classifier.predict(embed.cpu().numpy())
+    # evaluation of unknown_class_classifier
+    evaluation(map_label(dataset.test_unseen_label, dataset.novelclasses).cpu().numpy(), unknown_preds, 4)
+else:
+    # w/o test unknown classifier
+    unknown_preds = map_label(dataset.test_unseen_label, dataset.novelclasses).cpu().numpy()
 
 # 5th step: hybrid ultimate output (Unknown predictions intergration is optional)
 # inverse predictions for malicious traffic
@@ -268,10 +352,17 @@ dis_wrong_unknown = torch.where(score_for_unknown == 0)[0].to(device)
 with torch.no_grad():
     # 1.give misdiscriminated known malicious traffic new labels from unknown classes
     if len(dis_wrong_known) > 0:
-        known_features = dataset.test_seen_feature[dis_wrong_known]
-        corrected_known_preds = unknown_class_classifier.predict(mapper(known_features)[0].cpu().numpy())
-        corrected_known_preds_inverse = inverse_map(corrected_known_preds, dataset.novelclasses)
-        preds_all[dataset.benign_size_test + dis_wrong_known.cpu().numpy()] = corrected_known_preds_inverse
+        if opt.customized:
+            known_features = dataset.test_seen_feature[dis_wrong_known]
+            corrected_known_preds = unknown_class_classifier.predict(mapper(known_features)[0].cpu().numpy())
+            corrected_known_preds_inverse = inverse_map(corrected_known_preds, dataset.novelclasses)
+            preds_all[dataset.benign_size_test + dis_wrong_known.cpu().numpy()] = corrected_known_preds_inverse
+        else:
+            # random assignment for unseen classes
+            corrected_known_preds = torch.randint(low=0, high=dataset.novelclasses.shape[0],
+                                                  size=(dis_wrong_known.shape[0],))
+            corrected_known_preds_inverse = inverse_map(corrected_known_preds, dataset.novelclasses)
+            preds_all[dataset.benign_size_test + dis_wrong_known.cpu().numpy()] = corrected_known_preds_inverse
 
     # 2. give misdiscriminated unknown malicious traffic new labels from known classes
     if len(dis_wrong_unknown) > 0:
@@ -286,21 +377,41 @@ with torch.no_grad():
         test_benign_feature = dataset.test_feature[:dataset.benign_size_test]
         benign_features = test_benign_feature[det_wrong_benign]
 
-        indice_matrix = torch.IntTensor(size=(benign_features.shape[0], K)).to(device)
+        indice_matrix = torch.IntTensor(size=(benign_features.shape[0], opt.kmax)).to(device)
+        dis_matrix = torch.FloatTensor(size=(benign_features.shape[0], 1)).to(device)
+
         for i in trange(benign_features.shape[0]):
             expand_feature = benign_features[i].unsqueeze(0).expand_as(dataset.all_malicious_feature)
             dis = pairwise(expand_feature, dataset.all_malicious_feature)
             # sort and selection
-            _, indices = torch.topk(dis, k=K, largest=False)
-            indice_matrix[i] = indices
-        benign_discriminator_scores = indicator(indice_matrix, sentry).cpu().numpy()
+            distances, indices = torch.topk(dis, k=khat, largest=False)
+            indice_matrix[i] = indices[:opt.kmax]
+            dis_matrix[i] = distances.mean()
 
-        known_unknown_preds = np.where(benign_discriminator_scores < threshhold,
-                                       inverse_map(known_class_classifier.predict(benign_features.cpu().numpy()),
-                                                   dataset.knownclasses),
-                                       inverse_map(
-                                           unknown_class_classifier.predict(mapper(benign_features)[0].cpu().numpy()),
-                                           dataset.novelclasses))
+        adaptive_K = torch.zeros_like(dis_matrix).to(device)
+        min_distance = torch.min(dis_matrix)
+        max_distance = torch.max(dis_matrix)
+        normalized_distances = (dis_matrix - min_distance) / (max_distance - min_distance)
+        inverted_distances = 1 - normalized_distances
+        K_min = opt.kmin
+        K_max = opt.kmax
+        adaptive_K = (K_min + inverted_distances * (K_max - K_min)).long()
+
+        benign_discriminator_scores = indicator(indice_matrix, sentry).cpu().numpy()
+        if opt.customized:
+            known_unknown_preds = np.where(benign_discriminator_scores < threshhold,
+                                           inverse_map(known_class_classifier.predict(benign_features.cpu().numpy()),
+                                                       dataset.knownclasses),
+                                           inverse_map(unknown_class_classifier.predict(
+                                               mapper(benign_features)[0].cpu().numpy()), dataset.novelclasses))
+        else:
+            corrected_benign_unknown_preds = torch.randint(low=0, high=dataset.novelclasses.shape[0],
+                                                           size=(benign_features.shape[0],))
+            known_unknown_preds = np.where(benign_discriminator_scores < threshhold,
+                                           inverse_map(known_class_classifier.predict(benign_features.cpu().numpy()),
+                                                       dataset.knownclasses),
+                                           inverse_map(corrected_benign_unknown_preds, dataset.novelclasses))
+
         preds_all[det_wrong_benign.cpu().numpy()] = known_unknown_preds
 
     # 4. give undetected malicious traffic benign labels
@@ -309,3 +420,14 @@ with torch.no_grad():
 
 # Final evaluation
 evaluation(dataset.test_label.cpu().numpy(), preds_all, 5)
+# traffic_names = dataset.traffic_names
+# traffic_names[3] = "GoldenEye"
+# traffic_names[4] = "Hulk"
+# traffic_names[5] = "Slowhttptest"
+# traffic_names[6] = "Slowloris"
+# traffic_names[-1] = "XSS"
+# traffic_names[-2] = "Sql Injection"
+# traffic_names[-3] = "Brute Force"
+# confusion = ConfusionMatrix(num_classes=len(dataset.allclasses), labels=traffic_names, highlight_indices=dataset.novelclasses.cpu().numpy())
+# confusion.update(preds_all, dataset.test_label.cpu().numpy())
+# confusion.plot()
