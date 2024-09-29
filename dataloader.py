@@ -8,8 +8,7 @@ class DATA_LOADER(object):
         self.index_in_epoch = 0
         self.epochs_completed = 0
         # read malicious traffic and benign traffic
-        malicious_content = np.load(f"/home/wy/code/CE-GZSL/data/{opt.dataset}.npz",
-                                    allow_pickle=True)  # change to the root path
+        malicious_content = np.load(f"./data/{opt.dataset}.npz", allow_pickle=True)  # change to the root path
         benign_content = np.load("./data/benign.npz", allow_pickle=True)  # change to the root path
 
         # benign traffic feature and label

@@ -115,14 +115,8 @@ def evaluation(y_true, score, option):
         print(report)
         return
     if option == 5:
-        report = classification_report(y_true, score, target_names=dataset.traffic_names, digits=4, output_dict=True)
+        report = classification_report(y_true, score, target_names=dataset.traffic_names, digits=4)
         print(report)
-        df = pd.DataFrame(report).transpose()
-        drop_list = ['precision', 'f1-score', 'support']
-
-        for col in drop_list:
-            del df[col]
-        df.to_csv('./finalclswounknown' + '/' + opt.dataset + "result.csv", index=True)
         return
     # calculate AUC-ROC
     auc_roc = roc_auc_score(y_true, score)
@@ -202,7 +196,7 @@ def evaluation(y_true, score, option):
 parser = argparse.ArgumentParser()
 
 # set hyperparameters
-parser.add_argument('--dataset', default='3')
+parser.add_argument('--dataset', default='1')
 parser.add_argument('--manualSeed', type=int, default=42)
 parser.add_argument('--resSize', type=int, default=70, help='size of visual features')
 parser.add_argument('--embedSize', type=int, default=128, help='size of embedding h')
@@ -262,20 +256,11 @@ sentry = dataset.train_seen_feature.shape[0]
 # initailize hyperparameters and matrixes
 pairwise = nn.PairwiseDistance(p=2)
 khat = opt.khat
-indice_matrix = torch.IntTensor(size=(test_feature.shape[0], opt.kmax)).to(device)
-dis_matrix = torch.FloatTensor(size=(test_feature.shape[0], 1)).to(device)
 
 # training proceduce of discriminator
 print("start fittting and evaluating discriminator")
-start_time = time.time()
-for i in trange(test_feature.shape[0]):
-    expand_feature = test_feature[i].unsqueeze(0).expand_as(dataset.all_malicious_feature)
-    dis = pairwise(expand_feature, dataset.all_malicious_feature)
-    # sort and selection
-    distances, indices = torch.topk(dis, k=khat, largest=False)
-    indice_matrix[i] = indices[:opt.kmax]
-    dis_matrix[i] = distances.mean()
-
+indice_matrix = torch.load(f"./matrix/{opt.dataset}/indice_matrix.pt").to(device)
+dis_matrix = torch.load(f"./matrix/{opt.dataset}/dis_matrix.pt").to(device)
 # inference proceduce of discriminator
 adaptive_K = torch.zeros_like(dis_matrix).to(device)
 min_distance = torch.min(dis_matrix)
@@ -327,7 +312,7 @@ else:
 known_preds_inverse = inverse_map(known_preds, dataset.knownclasses)
 unknown_preds_inverse = inverse_map(unknown_preds, dataset.novelclasses)
 
-# collect all predictions (benign and malicious) and mask misclassified as 100
+# collect all predictions (benign and malicious)
 preds_all = np.concatenate(
     (detector_prediction[:dataset.benign_size_test].cpu().numpy(), known_preds_inverse, unknown_preds_inverse), axis=0)
 
@@ -420,14 +405,15 @@ with torch.no_grad():
 
 # Final evaluation
 evaluation(dataset.test_label.cpu().numpy(), preds_all, 5)
-# traffic_names = dataset.traffic_names
-# traffic_names[3] = "GoldenEye"
-# traffic_names[4] = "Hulk"
-# traffic_names[5] = "Slowhttptest"
-# traffic_names[6] = "Slowloris"
-# traffic_names[-1] = "XSS"
-# traffic_names[-2] = "Sql Injection"
-# traffic_names[-3] = "Brute Force"
-# confusion = ConfusionMatrix(num_classes=len(dataset.allclasses), labels=traffic_names, highlight_indices=dataset.novelclasses.cpu().numpy())
-# confusion.update(preds_all, dataset.test_label.cpu().numpy())
-# confusion.plot()
+traffic_names = dataset.traffic_names
+traffic_names[3] = "GoldenEye"
+traffic_names[4] = "Hulk"
+traffic_names[5] = "Slowhttptest"
+traffic_names[6] = "Slowloris"
+traffic_names[-1] = "XSS"
+traffic_names[-2] = "Sql Injection"
+traffic_names[-3] = "Brute Force"
+confusion = ConfusionMatrix(num_classes=len(dataset.allclasses), labels=traffic_names,
+                            highlight_indices=dataset.novelclasses.cpu().numpy())
+confusion.update(preds_all, dataset.test_label.cpu().numpy())
+confusion.plot()
